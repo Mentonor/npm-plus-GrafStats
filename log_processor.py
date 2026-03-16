@@ -44,6 +44,7 @@ CACHE_EXPIRATION_HOURS = 48
 INFLUX_TOKEN_FILE = os.path.join(DATA_DIR, "influxdb-token.txt")
 ABUSEIP_KEY_FILE = os.path.join(DATA_DIR, "abuseipdb-key.txt")
 MONITOR_FILE_PATH = os.path.join(DATA_DIR, "monitoringips.txt")
+WHITELIST_FILE_PATH = os.path.join(DATA_DIR, "whitelist_ips.txt")
 GEOIP_CITY_DB = "/geolite/GeoLite2-City.mmdb"
 GEOIP_ASN_DB = "/geolite/GeoLite2-ASN.mmdb"
 
@@ -103,6 +104,7 @@ _abuseip_key: str | None = None
 
 _external_ip: str | None = None
 _monitor_networks: list = []  # list of ipaddress.ip_network objects
+_whitelist_networks: list = []  # list of ipaddress.ip_network objects
 
 _influx_client = None
 _write_api = None
@@ -205,6 +207,39 @@ def _init_monitor_ips() -> None:
         print(f"Monitor IPs loaded: {len(_monitor_networks)} network(s).")
     except IOError as exc:
         print(f"Could not load monitor IPs ({exc}).")
+
+
+def _init_whitelist_ips() -> None:
+    global _whitelist_networks
+    networks = []
+
+    if os.path.exists(WHITELIST_FILE_PATH):
+        try:
+            with open(WHITELIST_FILE_PATH, 'r') as f:
+                for raw in f:
+                    entry = raw.strip()
+                    if not entry or entry.startswith('#'):
+                        continue
+                    try:
+                        networks.append(ipaddress.ip_network(entry, strict=False))
+                    except ValueError:
+                        print(f"Skipping invalid whitelist entry: {entry!r}")
+        except IOError as exc:
+            print(f"Could not load whitelist IPs from file ({exc}).")
+
+    env_val = os.getenv('WHITELIST_IPS', '')
+    for entry in re.split(r'[,\n]+', env_val):
+        entry = entry.strip()
+        if not entry or entry.startswith('#'):
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            print(f"Skipping invalid WHITELIST_IPS entry: {entry!r}")
+
+    _whitelist_networks = networks
+    if _whitelist_networks:
+        print(f"Whitelist IPs loaded: {len(_whitelist_networks)} network(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +461,16 @@ def _is_monitor(ip: str) -> bool:
         return False
 
 
+def _is_whitelisted(ip: str) -> bool:
+    if not _whitelist_networks:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _whitelist_networks)
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # InfluxDB point construction & writing
 # ---------------------------------------------------------------------------
@@ -556,6 +601,9 @@ def _process_line(line: str, log_type: str) -> None:
         if os.getenv('MONITORING_LOGS') == 'TRUE':
             _send(data, 'MonitoringRProxyIPs', with_geo=True)
 
+    elif _is_whitelisted(ip):
+        print(f"Whitelisted IP: {ip} called: {domain} – skipping AbuseIPDB and InfluxDB")
+
     else:
         measurement = 'ReverseProxyConnections' if log_type == 'proxy' else 'Redirections'
         _send(data, measurement, with_geo=True)
@@ -612,6 +660,7 @@ def main() -> None:
     _init_influx()
     _init_external_ip()
     _init_monitor_ips()
+    _init_whitelist_ips()
 
     global _batch_size
     try:
