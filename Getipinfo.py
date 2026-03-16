@@ -8,7 +8,8 @@ import json
 import time
 import fcntl
 from datetime import datetime, timedelta
-from ipaddress import ip_address, ip_network, AddressValueError
+import ipaddress
+from ipaddress import ip_address, IPv4Network, IPv6Network, AddressValueError
 import influxdb_client
 from influxdb_client.client.write_api import SYNCHRONOUS
 from ua_parser import user_agent_parser
@@ -74,7 +75,7 @@ def is_ip_whitelisted(ip_str, whitelist):
     try:
         ip_obj = ip_address(ip_str)
         for entry in whitelist:
-            if isinstance(entry, ip_network):
+            if isinstance(entry, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
                 if ip_obj in entry:
                     return True
             else:  # single IP address
