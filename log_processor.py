@@ -674,14 +674,14 @@ def main() -> None:
 
     if redirection_mode == 'TRUE':
         print("Mode: Reverse-Proxy + Redirection logs")
-        threads += _start_watchers('/logs/proxy-host-*_access.log',       'proxy')
-        threads += _start_watchers('/logs/redirection-host-*_access.log', 'redirection')
+        threads += _start_watchers('/nginx/*access.log',       'proxy')
+        threads += _start_watchers('/nginx/redirection-host-*_access.log', 'redirection')
     elif redirection_mode == 'ONLY':
         print("Mode: Redirection logs only")
-        threads += _start_watchers('/logs/redirection-host-*_access.log', 'redirection')
+        threads += _start_watchers('/nginx/redirection-host-*_access.log', 'redirection')
     else:
         print("Mode: Reverse-Proxy logs only")
-        threads += _start_watchers('/logs/proxy-host-*_access.log', 'proxy')
+        threads += _start_watchers('/nginx/*access.log', 'proxy')
 
     if not threads:
         print("ERROR: No log files found to monitor. Exiting.")
