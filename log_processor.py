@@ -58,8 +58,34 @@ _IPV4_RE = re.compile(
     r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
 )
 
-# Matches the content of a log line that contains at least one IPv4 address
-_HAS_IP_RE = re.compile(r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}')
+# Matches IPv6 addresses (full, compressed, and IPv4-mapped forms).
+# Alternatives are ordered longest/most-specific first so the regex engine
+# does not stop at a trailing '::' before consuming the remaining hex groups.
+_IPV6_RE = re.compile(
+    r'(?:'
+    r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'                              # 1:2:3:4:5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}'                         # 1::8  through  1:2:3:4:5:6::8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}'               # 1::7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}'               # 1::6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}'               # 1::5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}'               # 1::4:5:6:7:8
+    r'|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}'                         # 1::3:4:5:6:7:8
+    r'|:(?::[0-9a-fA-F]{1,4}){1,7}'                                           # ::2:3:4:5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,7}:'                                           # 1::  through  1:2:3:4:5:6:7::
+    r'|::'                                                                     # ::
+    r'|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]+'                        # fe80::...%eth0
+    r'|::(?:ffff(?::0{1,4})?:)?(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'   # ::ffff:1.2.3.4
+      r'(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    r'|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)' # 1:2:3:4::1.2.3.4
+      r'(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    r')'
+)
+
+# Matches a log line that contains at least one IPv4 or IPv6 address
+_HAS_IP_RE = re.compile(
+    r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}'           # IPv4
+    r'|(?:[0-9a-fA-F]{1,4}:){2}[0-9a-fA-F:]+'  # IPv6 (coarse check)
+)
 
 # Extracts the first domain-like token from a line
 # Note: original bash uses {1,3}? where ? makes the group optional (0-3 prefix labels)
@@ -73,14 +99,35 @@ _UA_RE = re.compile(r'\[Sent-to [^\]]+\] "([^"]*)"')
 # Extracts the forwarded-to host from "[Sent-to <ip>:<port>]"
 _SENT_TO_RE = re.compile(r'\[Sent-to ([^\]:]+)(?::\d+)?\]')
 
-# Private / RFC-1918 / loopback / link-local IPv6 ranges
-_INTERNAL_IP_RE = re.compile(
-    r'(^10(?:\.[0-9]{1,3}){3}$)'
-    r'|(^192\.168(?:\.[0-9]{1,3}){2}$)'
-    r'|(^172\.(?:1[6-9]|2[0-9]|3[0-1])(?:\.[0-9]{1,3}){2}$)'
-    r'|(^::1$)'
-    r'|(^f[cd][0-9a-fA-F]{2}:)'
-    r'|(^fe[89ab][0-9a-fA-F]:)'
+# ---------------------------------------------------------------------------
+# Strict NPMplus log-line schema validators
+# ---------------------------------------------------------------------------
+
+# Proxy log format:
+#   [DD/Mon/YYYY:HH:MM:SS +TTTT] proxy-domain client-ip session-time "request" statuscode response-size bytes [referer [ua]]
+# Groups: (1) client-ip  (2) statuscode  (3) response-size  (4) bytes
+_PROXY_LOG_SCHEMA_RE = re.compile(
+    r'^\['
+    r'\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}'  # timestamp
+    r'\]\s+'
+    r'\S+\s+'           # proxy-domain (may include /proxy-ip suffix)
+    r'(\S+)\s+'         # group 1: client-ip (IPv4 or IPv6)
+    r'\S+\s+'           # session-time
+    r'"[^"]*"\s+'       # quoted request line
+    r'(\d{3})\s+'       # group 2: HTTP status code
+    r'(\d+)\s+'         # group 3: response-size
+    r'(\d+)'            # group 4: bytes transferred
+)
+
+# Redirection log format:
+#   [DD/Mon/YYYY:HH:MM:SS +TTTT] statuscode client-ip [...]
+# Groups: (1) statuscode  (2) client-ip
+_REDIRECT_LOG_SCHEMA_RE = re.compile(
+    r'^\['
+    r'\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}'  # timestamp
+    r'\]\s+'
+    r'(\d{3})\s+'       # group 1: HTTP status code
+    r'(\S+)'            # group 2: client-ip (IPv4 or IPv6)
 )
 
 # Month abbreviation -> zero-padded number
@@ -270,8 +317,8 @@ def _parse_timestamp(line: str) -> str | None:
 
 
 def _extract_ips(line: str) -> list[str]:
-    """Return all IPv4 addresses found in *line*."""
-    return _IPV4_RE.findall(line)
+    """Return all IPv4 and IPv6 addresses found in *line*."""
+    return _IPV4_RE.findall(line) + _IPV6_RE.findall(line)
 
 
 def _extract_domain(line: str) -> str:
@@ -293,29 +340,43 @@ def _extract_target_ip(line: str) -> str:
 
 
 def _parse_proxy_line(line: str) -> dict | None:
-    """Parse a proxy-host access log line.
+    """Parse a proxy-host access log line using strict schema validation.
 
-    Field layout (1-indexed, space-delimited as used by the original bash):
-      f1=[timestamp  f2=+tz]  f3=outsideip  f4=-  f5=statuscode  …  f14=bytes
+    Expected NPMplus format:
+      [DD/Mon/YYYY:HH:MM:SS +TTTT] proxy-domain client-ip session-time "request" statuscode response-size bytes [referer [ua]]
+
+    The client IP is extracted from its fixed position (field 3 after the timestamp)
+    and validated via the ipaddress module, supporting both IPv4 and IPv6.
+    Malformed lines are logged and skipped.
     """
     ts = _parse_timestamp(line)
     if ts is None:
+        print(f"Malformed proxy log (invalid timestamp): {line!r}")
         return None
+
+    m = _PROXY_LOG_SCHEMA_RE.match(line)
+    if m is None:
+        print(f"Malformed proxy log (schema mismatch): {line!r}")
+        return None
+
+    outside_ip_raw = m.group(1)
     try:
-        fields = line.split(' ')
-        statuscode = int(fields[4])         # cut -d' ' -f5
+        outside_ip = str(ipaddress.ip_address(outside_ip_raw))  # validated & normalised
+    except ValueError:
+        print(f"Malformed proxy log (invalid client IP {outside_ip_raw!r}): {line!r}")
+        return None
+
+    try:
+        statuscode = int(m.group(2))
     except (IndexError, ValueError):
         statuscode = 0
+
     try:
-        length_raw = fields[13]             # awk '{print$14}'
-        m = re.search(r'\d+', length_raw)
-        length = int(m.group()) if m else 0
-    except (IndexError, AttributeError):
+        length = int(m.group(4))    # bytes transferred
+    except (IndexError, ValueError):
         length = 0
 
-    ips = _extract_ips(line)
-    outside_ip = ips[0] if ips else None
-    target_ip = _extract_target_ip(line) or (ips[1] if len(ips) > 1 else outside_ip)
+    target_ip = _extract_target_ip(line) or outside_ip
 
     return {
         'timestamp':  ts,
@@ -330,21 +391,36 @@ def _parse_proxy_line(line: str) -> dict | None:
 
 
 def _parse_redirection_line(line: str) -> dict | None:
-    """Parse a redirection-host access log line.
+    """Parse a redirection-host access log line using strict schema validation.
 
-    Field layout (1-indexed, space-delimited as used by the original bash):
-      f1=[timestamp  f2=+tz]  f3=statuscode  …
+    Expected format:
+      [DD/Mon/YYYY:HH:MM:SS +TTTT] statuscode client-ip [...]
+
+    The client IP is extracted from its fixed position and validated via the
+    ipaddress module, supporting both IPv4 and IPv6.
+    Malformed lines are logged and skipped.
     """
     ts = _parse_timestamp(line)
     if ts is None:
+        print(f"Malformed redirection log (invalid timestamp): {line!r}")
         return None
+
+    m = _REDIRECT_LOG_SCHEMA_RE.match(line)
+    if m is None:
+        print(f"Malformed redirection log (schema mismatch): {line!r}")
+        return None
+
     try:
-        statuscode = int(line.split(' ')[2])   # cut -d' ' -f3
+        statuscode = int(m.group(1))
     except (IndexError, ValueError):
         statuscode = 0
 
-    ips = _extract_ips(line)
-    outside_ip = ips[0] if ips else None
+    outside_ip_raw = m.group(2)
+    try:
+        outside_ip = str(ipaddress.ip_address(outside_ip_raw))  # validated & normalised
+    except ValueError:
+        print(f"Malformed redirection log (invalid client IP {outside_ip_raw!r}): {line!r}")
+        return None
 
     return {
         'timestamp':  ts,
@@ -444,7 +520,12 @@ def _persist_abuseip_cache() -> None:
 # ---------------------------------------------------------------------------
 
 def _is_internal(ip: str) -> bool:
-    return bool(_INTERNAL_IP_RE.match(ip))
+    """Return True if *ip* is a private, loopback, or link-local address (IPv4 or IPv6)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return False
 
 
 def _is_external_own(ip: str) -> bool:
