@@ -1,7 +1,7 @@
 # Stage 1: Build environment
 FROM python:3.14-slim AS builder
 
-LABEL maintainer="npmgrafstats@smilebasti.de"
+LABEL maintainer="github.com/Mentonor/npm-plus-GrafStats"
 
 # Setup home folder
 RUN mkdir -p /home/appuser/.config/NPMGRAF
