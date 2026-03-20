@@ -21,6 +21,7 @@ import fcntl
 import glob
 import ipaddress
 import threading
+import gc
 from datetime import datetime, timezone
 
 import geoip2.database
@@ -407,7 +408,7 @@ def _geoip_lookup(ip: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# AbuseIPDB lookup (in-memory cache, disk persistence)
+# AbuseIPDB lookup (in-memory cache, disk persistence, clean outdated IPs)
 # ---------------------------------------------------------------------------
 
 def _abuseip_lookup(ip: str) -> dict | None:
@@ -451,6 +452,17 @@ def _persist_abuseip_cache() -> None:
     except (IOError, OSError) as exc:
         print(f"Error persisting AbuseIPDB cache: {exc}")
 
+def _evict_abuseip_cache() -> None:
+    """Remove expired entries from the in-memory AbuseIPDB cache."""
+    now = time.time()
+    cutoff = now - CACHE_EXPIRATION_HOURS * 3600
+    with _abuseip_cache_lock:
+        expired = [ip for ip, v in _abuseip_cache.items()
+                   if v.get('timestamp', 0) < cutoff]
+        for ip in expired:
+            del _abuseip_cache[ip]
+    if expired:
+        _debug_print(f"[gc] Evicted {len(expired)} expired AbuseIPDB cache entries.")
 
 # ---------------------------------------------------------------------------
 # IP classification
@@ -728,6 +740,8 @@ def main() -> None:
             if not _debug_mode and time.monotonic() - _last_stats_time >= STATS_INTERVAL_S:
                 _print_stats()
                 _last_stats_time = time.monotonic()
+                _evict_abuseip_cache()
+                gc.collect()
     except KeyboardInterrupt:
         print("Shutting down…")
     finally:
