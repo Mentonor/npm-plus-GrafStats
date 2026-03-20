@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -u
 """Unified log processor for NPMplus/NginxProxyManager.
 
 Replaces sendips.sh, sendredirectionips.sh, Getipinfo.py, and Internalipinfo.py
