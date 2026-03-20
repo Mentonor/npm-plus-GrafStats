@@ -8,4 +8,4 @@ if [ -z "$INFLUX_TOKEN" ] && [ ! -f "/data/influxdb-token.txt" ]; then
     exit 1
 fi
 
-exec python /home/appuser/.config/NPMGRAF/log_processor.py
+exec python -u /home/appuser/.config/NPMGRAF/log_processor.py
