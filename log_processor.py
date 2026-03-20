@@ -21,7 +21,7 @@ import fcntl
 import glob
 import ipaddress
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 import geoip2.database
 import geoip2.errors
@@ -112,6 +112,54 @@ _influx_org: str = ""
 _batch_size: int = 1          # set from env BATCH_SIZE
 _batch: list = []
 _batch_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Debug mode and statistics
+# ---------------------------------------------------------------------------
+
+_debug_mode: bool = False   # enabled via --debug CLI arg or DEBUG=true env var
+
+_stats: dict = {
+    'total_sent': 0,            # total points successfully written to InfluxDB
+    'total_errors': 0,          # total failed InfluxDB writes
+    'send_timestamps': [],      # monotonic timestamps of every successful write
+    'last_db_response_ms': None,  # last round-trip latency in milliseconds
+}
+_stats_lock = threading.Lock()
+
+STATS_INTERVAL_S: int = 30   # how often (seconds) to print the summary line
+_last_stats_time: float = 0.0  # monotonic timestamp of last stats print
+
+
+def _debug_print(*args, **kwargs) -> None:
+    """Print only when debug mode is active."""
+    if _debug_mode:
+        print(*args, **kwargs)
+
+
+def _print_stats() -> None:
+    """Print a one-line statistics summary to stdout."""
+    now = time.monotonic()
+    one_min_ago  = now - 60
+    one_hour_ago = now - 3600
+
+    with _stats_lock:
+        total  = _stats['total_sent']
+        errors = _stats['total_errors']
+        last_db = _stats['last_db_response_ms']
+
+        # Trim timestamps older than 1 hour to avoid unbounded growth
+        _stats['send_timestamps'] = [
+            ts for ts in _stats['send_timestamps'] if ts >= one_hour_ago
+        ]
+        last_minute = sum(1 for ts in _stats['send_timestamps'] if ts >= one_min_ago)
+        last_hour   = len(_stats['send_timestamps'])
+
+    db_str = f"{last_db:.1f} ms" if last_db is not None else "N/A"
+    print(
+        f"[stats] total={total} | last_hour={last_hour} | last_minute={last_minute}"
+        f" | errors={errors} | last_db_latency={db_str}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -370,10 +418,10 @@ def _abuseip_lookup(ip: str) -> dict | None:
     with _abuseip_cache_lock:
         entry = _abuseip_cache.get(ip)
         if entry and now - entry.get('timestamp', 0) < CACHE_EXPIRATION_HOURS * 3600:
-            print(f"AbuseIPDB cache HIT: {ip}")
+            _debug_print(f"AbuseIPDB cache HIT: {ip}")
             return entry['data']
 
-    print(f"AbuseIPDB cache MISS: {ip}")
+    _debug_print(f"AbuseIPDB cache MISS: {ip}")
     try:
         resp = _requests_module.get(
             'https://api.abuseipdb.com/api/v2/check',
@@ -504,13 +552,22 @@ def _build_point(data: dict, measurement: str, with_geo: bool) -> influxdb_clien
 
 
 def _flush_batch(points: list) -> None:
-    """Write a list of points to InfluxDB."""
+    """Write a list of points to InfluxDB and update statistics."""
     if not points:
         return
+    t_start = time.monotonic()
     try:
         _write_api.write(bucket=_influx_bucket, org=_influx_org, record=points)
-        print(f"Wrote {len(points)} point(s) to InfluxDB.")
+        t_end = time.monotonic()
+        elapsed_ms = (t_end - t_start) * 1000
+        with _stats_lock:
+            _stats['total_sent'] += len(points)
+            _stats['last_db_response_ms'] = elapsed_ms
+            _stats['send_timestamps'].extend([t_end] * len(points))
+        _debug_print(f"Wrote {len(points)} point(s) to InfluxDB.")
     except Exception as exc:
+        with _stats_lock:
+            _stats['total_errors'] += len(points)
         print(f"InfluxDB write error: {exc}")
 
 
@@ -547,19 +604,19 @@ def _process_line(line: str, log_type: str) -> None:
     domain = data['domain']
 
     if _is_internal(ip) or _is_external_own(ip):
-        print(f"Internal IP-Source: {ip} called: {domain}")
+        _debug_print(f"Internal IP-Source: {ip} called: {domain}")
         if os.getenv('INTERNAL_LOGS') == 'TRUE':
             _send(data, 'InternalRProxyIPs', with_geo=False)
 
     elif _is_monitor(ip):
-        print(f"Excluded monitoring service: {ip} checked: {domain}")
+        _debug_print(f"Excluded monitoring service: {ip} checked: {domain}")
         if os.getenv('MONITORING_LOGS') == 'TRUE':
             _send(data, 'MonitoringRProxyIPs', with_geo=True)
 
     else:
         measurement = 'ReverseProxyConnections' if log_type == 'proxy' else 'Redirections'
         _send(data, measurement, with_geo=True)
-        print(f"Data sent: {measurement} – {ip} → {domain}")
+        _debug_print(f"Data sent: {measurement} – {ip} → {domain}")
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +660,25 @@ def _start_watchers(pattern: str, log_type: str) -> list[threading.Thread]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _debug_mode, _batch_size, _last_stats_time
+
+    # ------------------------------------------------------------------
+    # Debug mode: enabled by --debug CLI argument or DEBUG=true env var
+    # ------------------------------------------------------------------
+    _debug_mode = (
+        '--debug' in sys.argv
+        or os.getenv('DEBUG', '').lower() in ('true', '1', 'yes')
+    )
+
     print("npmGrafStats: Unified Python Log Processor")
+    if _debug_mode:
+        print("Debug mode: ON (verbose per-line logging enabled)")
+    else:
+        print(
+            "Debug mode: OFF  "
+            "(pass --debug or set DEBUG=true for verbose logs; "
+            f"stats printed every {STATS_INTERVAL_S}s)"
+        )
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -613,7 +688,6 @@ def main() -> None:
     _init_external_ip()
     _init_monitor_ips()
 
-    global _batch_size
     try:
         _batch_size = int(os.getenv('BATCH_SIZE', '1'))
     except ValueError:
@@ -639,8 +713,10 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Monitoring {len(threads)} log file(s). Press Ctrl-C to stop.")
+    _last_stats_time = time.monotonic()
     try:
         while True:
+            time.sleep(1)
             # Flush any remaining batched points periodically
             if _batch_size > 1:
                 with _batch_lock:
@@ -648,7 +724,10 @@ def main() -> None:
                         to_flush = _batch.copy()
                         _batch.clear()
                         _flush_batch(to_flush)
-            time.sleep(1)
+            # Print statistics summary at regular intervals
+            if not _debug_mode and time.monotonic() - _last_stats_time >= STATS_INTERVAL_S:
+                _print_stats()
+                _last_stats_time = time.monotonic()
     except KeyboardInterrupt:
         print("Shutting down…")
     finally:
@@ -657,6 +736,7 @@ def main() -> None:
             if _batch:
                 _flush_batch(_batch.copy())
                 _batch.clear()
+        _print_stats()
         if _city_reader:
             _city_reader.close()
         if _asn_reader:
