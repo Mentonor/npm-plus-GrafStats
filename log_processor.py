@@ -44,6 +44,7 @@ CACHE_EXPIRATION_HOURS = 48
 INFLUX_TOKEN_FILE = os.path.join(DATA_DIR, "influxdb-token.txt")
 ABUSEIP_KEY_FILE = os.path.join(DATA_DIR, "abuseipdb-key.txt")
 MONITOR_FILE_PATH = os.path.join(DATA_DIR, "monitoringips.txt")
+WHITELIST_FILE_PATH = os.path.join(DATA_DIR, "whitelist_ips.txt")
 GEOIP_CITY_DB = "/geolite/GeoLite2-City.mmdb"
 GEOIP_ASN_DB = "/geolite/GeoLite2-ASN.mmdb"
 
@@ -57,8 +58,34 @@ _IPV4_RE = re.compile(
     r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
 )
 
-# Matches the content of a log line that contains at least one IPv4 address
-_HAS_IP_RE = re.compile(r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}')
+# Matches IPv6 addresses (full, compressed, and IPv4-mapped forms).
+# Alternatives are ordered longest/most-specific first so the regex engine
+# does not stop at a trailing '::' before consuming the remaining hex groups.
+_IPV6_RE = re.compile(
+    r'(?:'
+    r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'                              # 1:2:3:4:5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}'                         # 1::8  through  1:2:3:4:5:6::8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}'               # 1::7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}'               # 1::6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}'               # 1::5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}'               # 1::4:5:6:7:8
+    r'|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}'                         # 1::3:4:5:6:7:8
+    r'|:(?::[0-9a-fA-F]{1,4}){1,7}'                                           # ::2:3:4:5:6:7:8
+    r'|(?:[0-9a-fA-F]{1,4}:){1,7}:'                                           # 1::  through  1:2:3:4:5:6:7::
+    r'|::'                                                                     # ::
+    r'|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]+'                        # fe80::...%eth0
+    r'|::(?:ffff(?::0{1,4})?:)?(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'   # ::ffff:1.2.3.4
+      r'(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    r'|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)' # 1:2:3:4::1.2.3.4
+      r'(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    r')'
+)
+
+# Matches a log line that contains at least one IPv4 or IPv6 address
+_HAS_IP_RE = re.compile(
+    r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}'           # IPv4
+    r'|(?:[0-9a-fA-F]{1,4}:){2}[0-9a-fA-F:]+'  # IPv6 (coarse check)
+)
 
 # Extracts the first domain-like token from a line
 # Note: original bash uses {1,3}? where ? makes the group optional (0-3 prefix labels)
@@ -72,14 +99,35 @@ _UA_RE = re.compile(r'\[Sent-to [^\]]+\] "([^"]*)"')
 # Extracts the forwarded-to host from "[Sent-to <ip>:<port>]"
 _SENT_TO_RE = re.compile(r'\[Sent-to ([^\]:]+)(?::\d+)?\]')
 
-# Private / RFC-1918 / loopback / link-local IPv6 ranges
-_INTERNAL_IP_RE = re.compile(
-    r'(^10(?:\.[0-9]{1,3}){3}$)'
-    r'|(^192\.168(?:\.[0-9]{1,3}){2}$)'
-    r'|(^172\.(?:1[6-9]|2[0-9]|3[0-1])(?:\.[0-9]{1,3}){2}$)'
-    r'|(^::1$)'
-    r'|(^f[cd][0-9a-fA-F]{2}:)'
-    r'|(^fe[89ab][0-9a-fA-F]:)'
+# ---------------------------------------------------------------------------
+# Strict NPMplus log-line schema validators
+# ---------------------------------------------------------------------------
+
+# Proxy log format:
+#   [DD/Mon/YYYY:HH:MM:SS +TTTT] proxy-domain client-ip session-time "request" statuscode response-size bytes [referer [ua]]
+# Groups: (1) client-ip  (2) statuscode  (3) response-size  (4) bytes
+_PROXY_LOG_SCHEMA_RE = re.compile(
+    r'^\['
+    r'\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}'  # timestamp
+    r'\]\s+'
+    r'\S+\s+'           # proxy-domain (may include /proxy-ip suffix)
+    r'(\S+)\s+'         # group 1: client-ip (IPv4 or IPv6)
+    r'\S+\s+'           # session-time
+    r'"[^"]*"\s+'       # quoted request line
+    r'(\d{3})\s+'       # group 2: HTTP status code
+    r'(\d+)\s+'         # group 3: response-size
+    r'(\d+)'            # group 4: bytes transferred
+)
+
+# Redirection log format:
+#   [DD/Mon/YYYY:HH:MM:SS +TTTT] statuscode client-ip [...]
+# Groups: (1) statuscode  (2) client-ip
+_REDIRECT_LOG_SCHEMA_RE = re.compile(
+    r'^\['
+    r'\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}'  # timestamp
+    r'\]\s+'
+    r'(\d{3})\s+'       # group 1: HTTP status code
+    r'(\S+)'            # group 2: client-ip (IPv4 or IPv6)
 )
 
 # Month abbreviation -> zero-padded number
@@ -103,6 +151,7 @@ _abuseip_key: str | None = None
 
 _external_ip: str | None = None
 _monitor_networks: list = []  # list of ipaddress.ip_network objects
+_whitelist_networks: list = []  # list of ipaddress.ip_network objects
 
 _influx_client = None
 _write_api = None
@@ -124,6 +173,9 @@ _stats: dict = {
     'total_errors': 0,          # total failed InfluxDB writes
     'send_timestamps': [],      # monotonic timestamps of every successful write
     'last_db_response_ms': None,  # last round-trip latency in milliseconds
+    'daily_abuseip_checks': 0,  # AbuseIPDB API calls made today
+    'daily_whitelist_hits': 0,  # IPs matched against whitelist today
+    'daily_reset_date': datetime.now().strftime('%Y-%m-%d'),  # date of last daily counter reset
 }
 _stats_lock = threading.Lock()
 
@@ -140,25 +192,36 @@ def _debug_print(*args, **kwargs) -> None:
 def _print_stats() -> None:
     """Print a one-line statistics summary to stdout."""
     now = time.monotonic()
-    one_min_ago  = now - 60
+    five_min_ago = now - 300
     one_hour_ago = now - 3600
+    today_str = datetime.now().strftime('%Y-%m-%d')
 
     with _stats_lock:
         total  = _stats['total_sent']
         errors = _stats['total_errors']
         last_db = _stats['last_db_response_ms']
 
+        # Reset daily counters when the date changes
+        if _stats['daily_reset_date'] != today_str:
+            _stats['daily_abuseip_checks'] = 0
+            _stats['daily_whitelist_hits'] = 0
+            _stats['daily_reset_date'] = today_str
+
+        daily_abuseip = _stats['daily_abuseip_checks']
+        daily_whitelist = _stats['daily_whitelist_hits']
+
         # Trim timestamps older than 1 hour to avoid unbounded growth
         _stats['send_timestamps'] = [
             ts for ts in _stats['send_timestamps'] if ts >= one_hour_ago
         ]
-        last_minute = sum(1 for ts in _stats['send_timestamps'] if ts >= one_min_ago)
-        last_hour   = len(_stats['send_timestamps'])
+        last_5min = sum(1 for ts in _stats['send_timestamps'] if ts >= five_min_ago)
+        last_hour = len(_stats['send_timestamps'])
 
     db_str = f"{last_db:.1f} ms" if last_db is not None else "N/A"
     print(
-        f"[stats] total={total} | last_hour={last_hour} | last_minute={last_minute}"
+        f"[stats] total={total} | last_hour={last_hour} | last_5min={last_5min}"
         f" | errors={errors} | last_db_latency={db_str}"
+        f" | daily_abuseip_checks={daily_abuseip} | daily_whitelist_hits={daily_whitelist}"
     )
 
 
@@ -255,6 +318,39 @@ def _init_monitor_ips() -> None:
         print(f"Could not load monitor IPs ({exc}).")
 
 
+def _init_whitelist_ips() -> None:
+    global _whitelist_networks
+    networks = []
+
+    if os.path.exists(WHITELIST_FILE_PATH):
+        try:
+            with open(WHITELIST_FILE_PATH, 'r') as f:
+                for raw in f:
+                    entry = raw.strip()
+                    if not entry or entry.startswith('#'):
+                        continue
+                    try:
+                        networks.append(ipaddress.ip_network(entry, strict=False))
+                    except ValueError:
+                        print(f"Skipping invalid whitelist entry: {entry!r}")
+        except IOError as exc:
+            print(f"Could not load whitelist IPs from file ({exc}).")
+
+    env_val = os.getenv('WHITELIST_IPS', '')
+    for entry in re.split(r'[,\n]+', env_val):
+        entry = entry.strip()
+        if not entry or entry.startswith('#'):
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            print(f"Skipping invalid WHITELIST_IPS entry: {entry!r}")
+
+    _whitelist_networks = networks
+    if _whitelist_networks:
+        print(f"Whitelist IPs loaded: {len(_whitelist_networks)} network(s).")
+
+
 # ---------------------------------------------------------------------------
 # Log-line parsing helpers
 # ---------------------------------------------------------------------------
@@ -283,8 +379,8 @@ def _parse_timestamp(line: str) -> str | None:
 
 
 def _extract_ips(line: str) -> list[str]:
-    """Return all IPv4 addresses found in *line*."""
-    return _IPV4_RE.findall(line)
+    """Return all IPv4 and IPv6 addresses found in *line*."""
+    return _IPV4_RE.findall(line) + _IPV6_RE.findall(line)
 
 
 def _extract_domain(line: str) -> str:
@@ -306,29 +402,43 @@ def _extract_target_ip(line: str) -> str:
 
 
 def _parse_proxy_line(line: str) -> dict | None:
-    """Parse a proxy-host access log line.
+    """Parse a proxy-host access log line using strict schema validation.
 
-    Field layout (1-indexed, space-delimited as used by the original bash):
-      f1=[timestamp  f2=+tz]  f3=outsideip  f4=-  f5=statuscode  …  f14=bytes
+    Expected NPMplus format:
+      [DD/Mon/YYYY:HH:MM:SS +TTTT] proxy-domain client-ip session-time "request" statuscode response-size bytes [referer [ua]]
+
+    The client IP is extracted from its fixed position (field 3 after the timestamp)
+    and validated via the ipaddress module, supporting both IPv4 and IPv6.
+    Malformed lines are logged and skipped.
     """
     ts = _parse_timestamp(line)
     if ts is None:
+        _debug_print(f"Malformed proxy log (invalid timestamp): {line!r}")
         return None
+
+    m = _PROXY_LOG_SCHEMA_RE.match(line)
+    if m is None:
+        _debug_print(f"Malformed proxy log (schema mismatch): {line!r}")
+        return None
+
+    outside_ip_raw = m.group(1)
     try:
-        fields = line.split(' ')
-        statuscode = int(fields[4])         # cut -d' ' -f5
+        outside_ip = str(ipaddress.ip_address(outside_ip_raw))  # validated & normalised
+    except ValueError:
+        _debug_print(f"Malformed proxy log (invalid client IP {outside_ip_raw!r}): {line!r}")
+        return None
+
+    try:
+        statuscode = int(m.group(2))
     except (IndexError, ValueError):
         statuscode = 0
+
     try:
-        length_raw = fields[13]             # awk '{print$14}'
-        m = re.search(r'\d+', length_raw)
-        length = int(m.group()) if m else 0
-    except (IndexError, AttributeError):
+        length = int(m.group(4))    # bytes transferred
+    except (IndexError, ValueError):
         length = 0
 
-    ips = _extract_ips(line)
-    outside_ip = ips[0] if ips else None
-    target_ip = _extract_target_ip(line) or (ips[1] if len(ips) > 1 else outside_ip)
+    target_ip = _extract_target_ip(line) or outside_ip
 
     return {
         'timestamp':  ts,
@@ -343,21 +453,36 @@ def _parse_proxy_line(line: str) -> dict | None:
 
 
 def _parse_redirection_line(line: str) -> dict | None:
-    """Parse a redirection-host access log line.
+    """Parse a redirection-host access log line using strict schema validation.
 
-    Field layout (1-indexed, space-delimited as used by the original bash):
-      f1=[timestamp  f2=+tz]  f3=statuscode  …
+    Expected format:
+      [DD/Mon/YYYY:HH:MM:SS +TTTT] statuscode client-ip [...]
+
+    The client IP is extracted from its fixed position and validated via the
+    ipaddress module, supporting both IPv4 and IPv6.
+    Malformed lines are logged and skipped.
     """
     ts = _parse_timestamp(line)
     if ts is None:
+        _debug_print(f"Malformed redirection log (invalid timestamp): {line!r}")
         return None
+
+    m = _REDIRECT_LOG_SCHEMA_RE.match(line)
+    if m is None:
+        _debug_print(f"Malformed redirection log (schema mismatch): {line!r}")
+        return None
+
     try:
-        statuscode = int(line.split(' ')[2])   # cut -d' ' -f3
+        statuscode = int(m.group(1))
     except (IndexError, ValueError):
         statuscode = 0
 
-    ips = _extract_ips(line)
-    outside_ip = ips[0] if ips else None
+    outside_ip_raw = m.group(2)
+    try:
+        outside_ip = str(ipaddress.ip_address(outside_ip_raw))  # validated & normalised
+    except ValueError:
+        _debug_print(f"Malformed redirection log (invalid client IP {outside_ip_raw!r}): {line!r}")
+        return None
 
     return {
         'timestamp':  ts,
@@ -422,6 +547,8 @@ def _abuseip_lookup(ip: str) -> dict | None:
             return entry['data']
 
     _debug_print(f"AbuseIPDB cache MISS: {ip}")
+    with _stats_lock:
+        _stats['daily_abuseip_checks'] += 1
     try:
         resp = _requests_module.get(
             'https://api.abuseipdb.com/api/v2/check',
@@ -457,7 +584,12 @@ def _persist_abuseip_cache() -> None:
 # ---------------------------------------------------------------------------
 
 def _is_internal(ip: str) -> bool:
-    return bool(_INTERNAL_IP_RE.match(ip))
+    """Return True if *ip* is a private, loopback, or link-local address (IPv4 or IPv6)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return False
 
 
 def _is_external_own(ip: str) -> bool:
@@ -470,6 +602,16 @@ def _is_monitor(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
         return any(addr in net for net in _monitor_networks)
+    except ValueError:
+        return False
+
+
+def _is_whitelisted(ip: str) -> bool:
+    if not _whitelist_networks:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _whitelist_networks)
     except ValueError:
         return False
 
@@ -613,6 +755,11 @@ def _process_line(line: str, log_type: str) -> None:
         if os.getenv('MONITORING_LOGS') == 'TRUE':
             _send(data, 'MonitoringRProxyIPs', with_geo=True)
 
+    elif _is_whitelisted(ip):
+        _debug_print(f"Whitelisted IP: {ip} called: {domain} – skipping AbuseIPDB and InfluxDB")
+        with _stats_lock:
+            _stats['daily_whitelist_hits'] += 1
+
     else:
         measurement = 'ReverseProxyConnections' if log_type == 'proxy' else 'Redirections'
         _send(data, measurement, with_geo=True)
@@ -687,6 +834,7 @@ def main() -> None:
     _init_influx()
     _init_external_ip()
     _init_monitor_ips()
+    _init_whitelist_ips()
 
     try:
         _batch_size = int(os.getenv('BATCH_SIZE', '1'))
