@@ -19,9 +19,14 @@ import time
 import json
 import fcntl
 import glob
+import fnmatch
+import signal
 import ipaddress
 import threading
 from datetime import datetime, timezone
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 import geoip2.database
 import geoip2.errors
@@ -47,6 +52,21 @@ MONITOR_FILE_PATH = os.path.join(DATA_DIR, "monitoringips.txt")
 WHITELIST_FILE_PATH = os.path.join(DATA_DIR, "whitelist_ips.txt")
 GEOIP_CITY_DB = "/geolite/GeoLite2-City.mmdb"
 GEOIP_ASN_DB = "/geolite/GeoLite2-ASN.mmdb"
+
+# ---------------------------------------------------------------------------
+# Tail and health-check configuration
+# ---------------------------------------------------------------------------
+TAIL_NO_DATA_REOPEN_S: int   = 60    # reopen file when no new data arrives for this many seconds
+TAIL_ROTATION_CHECK_S: float = 5.0   # check for file rotation every N seconds
+TAIL_SLEEP_S: float          = 0.05  # sleep between readline() attempts
+
+HEALTH_CHECK_INTERVAL_S: int = 60    # run the health-check sweep every N seconds
+
+# ---------------------------------------------------------------------------
+# InfluxDB retry configuration
+# ---------------------------------------------------------------------------
+INFLUX_MAX_RETRIES: int    = 5    # maximum write retry attempts
+INFLUX_RETRY_BASE_S: float = 1.0  # initial backoff; doubles on each subsequent retry
 
 # ---------------------------------------------------------------------------
 # Compiled regular expressions (built once, reused for every log line)
@@ -163,6 +183,17 @@ _batch: list = []
 _batch_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Shutdown coordination & active tail tracking
+# ---------------------------------------------------------------------------
+
+# Set by signal handlers; all long-running loops poll this event.
+_shutdown_event = threading.Event()
+
+# Maps filepath -> Thread for all currently running tail threads.
+_active_tails: dict = {}
+_active_tails_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # Debug mode and statistics
 # ---------------------------------------------------------------------------
 
@@ -187,6 +218,13 @@ def _debug_print(*args, **kwargs) -> None:
     """Print only when debug mode is active."""
     if _debug_mode:
         print(*args, **kwargs)
+
+
+def _signal_handler(signum, frame) -> None:
+    """Handle SIGTERM / SIGINT by setting the global shutdown event."""
+    sig_name = signal.Signals(signum).name
+    print(f"\n[shutdown] Received {sig_name}, initiating graceful shutdown...")
+    _shutdown_event.set()
 
 
 def _print_stats() -> None:
@@ -694,23 +732,33 @@ def _build_point(data: dict, measurement: str, with_geo: bool) -> influxdb_clien
 
 
 def _flush_batch(points: list) -> None:
-    """Write a list of points to InfluxDB and update statistics."""
+    """Write a list of points to InfluxDB with exponential-backoff retry."""
     if not points:
         return
-    t_start = time.monotonic()
-    try:
-        _write_api.write(bucket=_influx_bucket, org=_influx_org, record=points)
-        t_end = time.monotonic()
-        elapsed_ms = (t_end - t_start) * 1000
-        with _stats_lock:
-            _stats['total_sent'] += len(points)
-            _stats['last_db_response_ms'] = elapsed_ms
-            _stats['send_timestamps'].extend([t_end] * len(points))
-        _debug_print(f"Wrote {len(points)} point(s) to InfluxDB.")
-    except Exception as exc:
-        with _stats_lock:
-            _stats['total_errors'] += len(points)
-        print(f"InfluxDB write error: {exc}")
+    for attempt in range(INFLUX_MAX_RETRIES):
+        t_start = time.monotonic()
+        try:
+            _write_api.write(bucket=_influx_bucket, org=_influx_org, record=points)
+            t_end = time.monotonic()
+            elapsed_ms = (t_end - t_start) * 1000
+            with _stats_lock:
+                _stats['total_sent'] += len(points)
+                _stats['last_db_response_ms'] = elapsed_ms
+                _stats['send_timestamps'].extend([t_end] * len(points))
+            _debug_print(f"Wrote {len(points)} point(s) to InfluxDB.")
+            return
+        except Exception as exc:
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            print(f"[{ts}] InfluxDB write error (attempt {attempt + 1}/{INFLUX_MAX_RETRIES}): {exc}")
+            if attempt < INFLUX_MAX_RETRIES - 1 and not _shutdown_event.is_set():
+                wait_s = INFLUX_RETRY_BASE_S * (2 ** attempt)
+                print(f"[{ts}] Retrying in {wait_s:.1f}s…")
+                _shutdown_event.wait(timeout=wait_s)
+    # All retries exhausted
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    print(f"[{ts}] InfluxDB write failed after {INFLUX_MAX_RETRIES} attempts – {len(points)} point(s) lost.")
+    with _stats_lock:
+        _stats['total_errors'] += len(points)
 
 
 def _send(data: dict, measurement: str, with_geo: bool) -> None:
@@ -767,39 +815,169 @@ def _process_line(line: str, log_type: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Log-file tail (one thread per file)
+# Log-file tail (one non-daemon thread per file)
 # ---------------------------------------------------------------------------
 
 def _tail_file(filepath: str, log_type: str) -> None:
-    """Tail *filepath* indefinitely, calling _process_line for each new line."""
-    print(f"Tailing: {filepath}  (type={log_type})")
-    try:
-        with open(filepath, 'r', errors='replace') as fh:
-            fh.seek(0, 2)           # jump to end – skip historical entries
-            while True:
-                line = fh.readline()
-                if line:
-                    _process_line(line.rstrip('\n'), log_type)
-                else:
-                    time.sleep(0.05)
-    except FileNotFoundError:
-        print(f"File not found: {filepath}")
-    except Exception as exc:
-        print(f"Error tailing {filepath}: {exc}")
+    """Tail *filepath* until the shutdown event is set.
+
+    Handles file rotation by comparing inodes periodically and by reopening
+    the file whenever no new data has been seen for *TAIL_NO_DATA_REOPEN_S*
+    seconds.  Missing files are retried every 5 seconds so that newly
+    rotated files are picked up automatically.
+    """
+    print(f"[tail] Starting: {filepath}  (type={log_type})")
+    while not _shutdown_event.is_set():
+        try:
+            with open(filepath, 'r', errors='replace') as fh:
+                inode = os.fstat(fh.fileno()).st_ino
+                fh.seek(0, 2)           # jump to end – skip historical entries
+                last_read_time = time.monotonic()
+                last_rotation_check = time.monotonic()
+
+                while not _shutdown_event.is_set():
+                    line = fh.readline()
+                    if line:
+                        _process_line(line.rstrip('\n'), log_type)
+                        last_read_time = time.monotonic()
+                    else:
+                        _shutdown_event.wait(timeout=TAIL_SLEEP_S)
+                        now = time.monotonic()
+
+                        # Periodic rotation / deletion check
+                        if now - last_rotation_check >= TAIL_ROTATION_CHECK_S:
+                            last_rotation_check = now
+                            try:
+                                st = os.stat(filepath)
+                                if st.st_ino != inode:
+                                    print(f"[tail] Inode changed – file rotated: {filepath}")
+                                    break
+                                if st.st_size < fh.tell():
+                                    print(f"[tail] File truncated: {filepath}")
+                                    break
+                            except FileNotFoundError:
+                                print(f"[tail] File deleted: {filepath}")
+                                break
+
+                        # Fallback timeout: reopen if no new data for a long time
+                        if now - last_read_time >= TAIL_NO_DATA_REOPEN_S:
+                            print(f"[tail] No data for {TAIL_NO_DATA_REOPEN_S}s, reopening: {filepath}")
+                            break
+
+        except FileNotFoundError:
+            print(f"[tail] File not found: {filepath} – waiting 5s for it to appear…")
+            _shutdown_event.wait(timeout=5.0)
+        except Exception as exc:
+            print(f"[tail] Unexpected error on {filepath}: {exc}")
+            _shutdown_event.wait(timeout=5.0)
+
+    with _active_tails_lock:
+        _active_tails.pop(filepath, None)
+    print(f"[tail] Stopped: {filepath}")
 
 
-def _start_watchers(pattern: str, log_type: str) -> list[threading.Thread]:
-    """Spawn a daemon thread for each file matching *pattern*."""
+def _start_tail(filepath: str, log_type: str) -> threading.Thread | None:
+    """Spawn a non-daemon tail thread for *filepath* unless one is already running."""
+    with _active_tails_lock:
+        existing = _active_tails.get(filepath)
+        if existing is not None and existing.is_alive():
+            _debug_print(f"[tail] Already running for: {filepath}")
+            return None
+        t = threading.Thread(
+            target=_tail_file,
+            args=(filepath, log_type),
+            daemon=False,
+            name=f"tail-{os.path.basename(filepath)}",
+        )
+        t.start()
+        _active_tails[filepath] = t
+        return t
+
+
+def _start_initial_watchers(pattern: str, log_type: str) -> list:
+    """Start tail threads for all files currently matching *pattern*."""
     matched = sorted(glob.glob(pattern))
     if not matched:
-        print(f"No log files matched: {pattern}")
+        print(f"[tail] No log files matched pattern: {pattern}")
         return []
-    threads = []
+    started = []
     for path in matched:
-        t = threading.Thread(target=_tail_file, args=(path, log_type), daemon=True, name=path)
-        t.start()
-        threads.append(t)
-    return threads
+        t = _start_tail(path, log_type)
+        if t is not None:
+            started.append(t)
+    return started
+
+
+# ---------------------------------------------------------------------------
+# Health-check: periodically detect new / rotated files
+# ---------------------------------------------------------------------------
+
+def _health_check(patterns: list) -> None:
+    """Sweep the log directory at regular intervals.
+
+    * Removes entries for tail threads that have already stopped.
+    * Starts new tail threads for files that match a watched pattern but are
+      not yet being tailed (covers files created after the initial scan).
+    """
+    while not _shutdown_event.is_set():
+        _shutdown_event.wait(timeout=HEALTH_CHECK_INTERVAL_S)
+        if _shutdown_event.is_set():
+            break
+
+        # Reap dead threads from the registry
+        with _active_tails_lock:
+            dead = [p for p, t in _active_tails.items() if not t.is_alive()]
+        for path in dead:
+            print(f"[health] Tail thread finished for: {path}")
+            with _active_tails_lock:
+                _active_tails.pop(path, None)
+
+        # Start tails for any newly matching files
+        for pattern, log_type in patterns:
+            for path in sorted(glob.glob(pattern)):
+                with _active_tails_lock:
+                    already = path in _active_tails and _active_tails[path].is_alive()
+                if not already:
+                    print(f"[health] Starting tail for newly found file: {path}")
+                    _start_tail(path, log_type)
+
+        # Log current state
+        with _active_tails_lock:
+            alive_count = sum(1 for t in _active_tails.values() if t.is_alive())
+        print(f"[health] Active tail threads: {alive_count}")
+
+
+# ---------------------------------------------------------------------------
+# Watchdog handler: react to filesystem events in the log directory
+# ---------------------------------------------------------------------------
+
+class _LogDirectoryHandler(FileSystemEventHandler):
+    """Start a tail thread when a new log file matching a watched pattern appears."""
+
+    def __init__(self, patterns: list) -> None:
+        # patterns: list of (glob_pattern, log_type)
+        self._patterns = patterns
+
+    def on_created(self, event) -> None:
+        if event.is_directory:
+            return
+        path = event.src_path
+        for pattern, log_type in self._patterns:
+            if fnmatch.fnmatch(path, pattern):
+                print(f"[watchdog] New log file detected: {path}")
+                _start_tail(path, log_type)
+                break
+
+    def on_moved(self, event) -> None:
+        # A file was moved *into* the watched directory (rotation destination)
+        if event.is_directory:
+            return
+        path = event.dest_path
+        for pattern, log_type in self._patterns:
+            if fnmatch.fnmatch(path, pattern):
+                print(f"[watchdog] Log file moved/rotated in: {path}")
+                _start_tail(path, log_type)
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -842,48 +1020,113 @@ def main() -> None:
         _batch_size = 1
     print(f"Batch size: {_batch_size}")
 
-    redirection_mode = os.getenv('REDIRECTION_LOGS', '')
-    threads: list[threading.Thread] = []
+    # ------------------------------------------------------------------
+    # Register signal handlers for graceful shutdown
+    # ------------------------------------------------------------------
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
+    # ------------------------------------------------------------------
+    # Determine watch patterns based on REDIRECTION_LOGS mode
+    # ------------------------------------------------------------------
+    redirection_mode = os.getenv('REDIRECTION_LOGS', '')
     if redirection_mode == 'TRUE':
         print("Mode: Reverse-Proxy + Redirection logs")
-        threads += _start_watchers('/logs/proxy-host-*_access.log',       'proxy')
-        threads += _start_watchers('/logs/redirection-host-*_access.log', 'redirection')
+        patterns = [
+            ('/logs/proxy-host-*_access.log',       'proxy'),
+            ('/logs/redirection-host-*_access.log', 'redirection'),
+        ]
     elif redirection_mode == 'ONLY':
         print("Mode: Redirection logs only")
-        threads += _start_watchers('/logs/redirection-host-*_access.log', 'redirection')
+        patterns = [('/logs/redirection-host-*_access.log', 'redirection')]
     else:
         print("Mode: Reverse-Proxy logs only")
-        threads += _start_watchers('/logs/proxy-host-*_access.log', 'proxy')
+        patterns = [('/logs/proxy-host-*_access.log', 'proxy')]
 
-    if not threads:
-        print("ERROR: No log files found to monitor. Exiting.")
-        sys.exit(1)
+    # ------------------------------------------------------------------
+    # Start initial tail threads for currently existing log files
+    # ------------------------------------------------------------------
+    for pattern, log_type in patterns:
+        _start_initial_watchers(pattern, log_type)
 
-    print(f"Monitoring {len(threads)} log file(s). Press Ctrl-C to stop.")
+    with _active_tails_lock:
+        initial_count = len(_active_tails)
+    if initial_count == 0:
+        print("WARNING: No log files found to monitor at startup; waiting for files to appear.")
+
+    # ------------------------------------------------------------------
+    # Start watchdog observer to detect new / rotated log files
+    # ------------------------------------------------------------------
+    log_dir = '/logs'
+    observer = None
+    if os.path.isdir(log_dir):
+        handler = _LogDirectoryHandler(patterns)
+        observer = Observer()
+        observer.schedule(handler, log_dir, recursive=False)
+        observer.start()
+        print(f"[watchdog] Monitoring directory: {log_dir}")
+    else:
+        print(f"[watchdog] WARNING: Log directory not found: {log_dir} – watchdog not started.")
+
+    # ------------------------------------------------------------------
+    # Start health-check thread
+    # ------------------------------------------------------------------
+    health_thread = threading.Thread(
+        target=_health_check,
+        args=(patterns,),
+        daemon=False,
+        name='health-check',
+    )
+    health_thread.start()
+
+    print(f"Monitoring log files. Press Ctrl-C or send SIGTERM to stop.")
     _last_stats_time = time.monotonic()
     try:
-        while True:
-            time.sleep(1)
+        while not _shutdown_event.is_set():
+            _shutdown_event.wait(timeout=1.0)
             # Flush any remaining batched points periodically
             if _batch_size > 1:
+                to_flush = []
                 with _batch_lock:
                     if _batch:
                         to_flush = _batch.copy()
                         _batch.clear()
-                        _flush_batch(to_flush)
+                if to_flush:
+                    _flush_batch(to_flush)
             # Print statistics summary at regular intervals
             if not _debug_mode and time.monotonic() - _last_stats_time >= STATS_INTERVAL_S:
                 _print_stats()
                 _last_stats_time = time.monotonic()
     except KeyboardInterrupt:
-        print("Shutting down…")
+        print("[shutdown] KeyboardInterrupt received.")
+        _shutdown_event.set()
     finally:
+        print("[shutdown] Stopping background services…")
+
+        # Stop watchdog observer
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=5.0)
+
+        # Wait for health-check thread
+        health_thread.join(timeout=10.0)
+
+        # Wait for all tail threads to finish
+        with _active_tails_lock:
+            tail_threads = list(_active_tails.values())
+        print(f"[shutdown] Waiting for {len(tail_threads)} tail thread(s) to finish…")
+        for t in tail_threads:
+            t.join(timeout=10.0)
+
         # Flush remaining batch
+        to_flush = []
         with _batch_lock:
             if _batch:
-                _flush_batch(_batch.copy())
+                to_flush = _batch.copy()
                 _batch.clear()
+        if to_flush:
+            _flush_batch(to_flush)
+
         _print_stats()
         if _city_reader:
             _city_reader.close()
@@ -891,6 +1134,7 @@ def main() -> None:
             _asn_reader.close()
         if _influx_client:
             _influx_client.close()
+        print("[shutdown] Shutdown complete.")
 
 
 if __name__ == '__main__':
